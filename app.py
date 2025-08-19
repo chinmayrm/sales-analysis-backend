@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 app = Flask(__name__)
 CORS(app)
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "model/model.pkl")
+MODEL_PATH = os.path.join(os.getcwd(), "model.pkl")
 
 # Candidate column names
 DATE_COLS = {"date", "order_date", "day", "datetime", "timestamp"}
