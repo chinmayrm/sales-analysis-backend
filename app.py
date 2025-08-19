@@ -58,11 +58,12 @@ def _prepare_sales(df, cols):
     return d
 
 def _aggregate_daily(d, cols):
+    # FIXED: Corrected the bracket syntax error on this line
     daily = d.groupby(d[cols["date"]].dt.date).agg(
         revenue=("__revenue__", "sum"),
         units=(cols["units"], "sum"),
         orders=("__revenue__", "count")
-    ).reset_index().rename(columns={cols["date"]]: "date"})
+    ).reset_index().rename(columns={cols["date"]: "date"})  # Fixed the bracket issue here
     daily["date"] = pd.to_datetime(daily["date"])
     daily["return_rev"] = daily["revenue"].pct_change().fillna(0.0)
     return daily
