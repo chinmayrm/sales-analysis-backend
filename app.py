@@ -14,6 +14,7 @@ from sklearn.preprocessing import StandardScaler
 app = Flask(__name__)
 CORS(app)
 
+# Save model directly in current directory
 MODEL_PATH = os.path.join(os.getcwd(), "model.pkl")
 
 # Candidate column names
@@ -58,12 +59,11 @@ def _prepare_sales(df, cols):
     return d
 
 def _aggregate_daily(d, cols):
-    # FIXED: Corrected the bracket syntax error on this line
     daily = d.groupby(d[cols["date"]].dt.date).agg(
         revenue=("__revenue__", "sum"),
         units=(cols["units"], "sum"),
         orders=("__revenue__", "count")
-    ).reset_index().rename(columns={cols["date"]: "date"})  # Fixed the bracket issue here
+    ).reset_index().rename(columns={cols["date"]: "date"})
     daily["date"] = pd.to_datetime(daily["date"])
     daily["return_rev"] = daily["revenue"].pct_change().fillna(0.0)
     return daily
@@ -195,15 +195,30 @@ def train():
         "ma_windows": [7, 28],
         "trained_at": datetime.utcnow().isoformat() + "Z"
     }
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    
+    # Save model directly in current directory (no subfolder needed)
     joblib.dump(model, MODEL_PATH)
-    return jsonify({"message": "Model trained and saved.", "model_path": MODEL_PATH, "meta": {"trend_slope": slope, "volatility": vol, "cols": cols}})
+    
+    return jsonify({
+        "message": "Model trained and saved.", 
+        "model_path": MODEL_PATH, 
+        "meta": {
+            "trend_slope": slope, 
+            "volatility": vol, 
+            "cols": cols
+        }
+    })
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
     if not os.path.exists(MODEL_PATH):
         return jsonify({"error": "Model not found — train first."}), 400
-    model = joblib.load(MODEL_PATH)
+    
+    try:
+        model = joblib.load(MODEL_PATH)
+    except Exception as e:
+        return jsonify({"error": f"Error loading model: {str(e)}"}), 500
+        
     cols = model["cols"]
     ma_windows = model.get("ma_windows", [7, 28])
 
