@@ -14,8 +14,8 @@ from sklearn.preprocessing import StandardScaler
 app = Flask(__name__)
 CORS(app)
 
-# Save model directly in current directory
-MODEL_PATH = os.path.join(os.getcwd(), "model.pkl")
+# Use /tmp directory for model storage on Render (only writable location)
+MODEL_PATH = os.path.join('/tmp', 'sales_model.pkl')
 
 # Candidate column names
 DATE_COLS = {"date", "order_date", "day", "datetime", "timestamp"}
@@ -196,8 +196,11 @@ def train():
         "trained_at": datetime.utcnow().isoformat() + "Z"
     }
     
-    # Save model directly in current directory (no subfolder needed)
-    joblib.dump(model, MODEL_PATH)
+    # Save model to /tmp directory (writable on Render)
+    try:
+        joblib.dump(model, MODEL_PATH)
+    except Exception as e:
+        return jsonify({"error": f"Failed to save model: {str(e)}"}), 500
     
     return jsonify({
         "message": "Model trained and saved.", 
@@ -326,4 +329,4 @@ def analyze():
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
