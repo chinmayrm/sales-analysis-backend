@@ -1,3 +1,4 @@
+
 import os
 import io
 import json
@@ -10,12 +11,19 @@ from flask_cors import CORS
 from sklearn.ensemble import IsolationForest
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
+import logging
 
 app = Flask(__name__)
 CORS(app)
 
-# Use /tmp directory for model storage on Render (only writable location)
-MODEL_PATH = os.path.join('/tmp', 'sales_model.pkl')
+MODEL_DIR = os.environ.get("MODEL_DIR", "model")
+MODEL_PATH = os.path.join(MODEL_DIR, "model.pkl")
+SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
+META_PATH = os.path.join(MODEL_DIR, "meta.json")
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+
 
 # Candidate column names
 DATE_COLS = {"date", "order_date", "day", "datetime", "timestamp"}
@@ -24,6 +32,15 @@ PRODUCT_NAME_COLS = {"product_name", "name", "title"}
 PRICE_COLS = {"price", "unit_price", "selling_price"}
 UNITS_COLS = {"qty", "quantity", "units", "sold", "selling_number", "sales", "units_sold"}
 RATING_COLS = {"rating", "stars", "review_rating"}
+def _validate_csv(file):
+    if not file or not file.filename.endswith('.csv'):
+        return False, "File must be a CSV."
+    file.seek(0, os.SEEK_END)
+    size = file.tell()
+    file.seek(0)
+    if size > 10 * 1024 * 1024:  # 10MB limit
+        return False, "File too large (max 10MB)."
+    return True, None
 
 def _infer_col(df, candidates, numeric=False):
     for c in df.columns:
@@ -147,16 +164,23 @@ def _advisory(trend_slope, vol, anomaly_rate):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok"}
+    """Health check endpoint."""
+    return jsonify({"status": "ok"})
+
 
 @app.route("/train", methods=["POST"])
 def train():
+    """Train a new model from uploaded sales CSV."""
     if 'file' not in request.files:
         return jsonify({"error": "Upload CSV in form field 'file'"}), 400
     f = request.files['file']
+    valid, err = _validate_csv(f)
+    if not valid:
+        return jsonify({"error": err}), 400
     try:
         df = pd.read_csv(f)
     except Exception as e:
+        logging.error(f"CSV parse error: {e}")
         return jsonify({"error": f"CSV parse error: {e}"}), 400
 
     cols = {
@@ -171,66 +195,64 @@ def train():
     if not cols["date"] or not cols["price"] or not cols["units"]:
         return jsonify({"error": "Need date, price, and units columns (provide via form or ensure auto-detectable)."}), 400
 
-    d = _prepare_sales(df, cols)
-    daily = _aggregate_daily(d, cols)
-    if len(daily) < 20:
-        return jsonify({"error": "Need at least 20 daily rows after aggregation to train."}), 400
-
-    # Isolation Forest on revenue returns
-    X = daily[["return_rev"]].to_numpy()
-    scaler = StandardScaler().fit(X)
-    Xs = scaler.transform(X)
-    iso = IsolationForest(random_state=42, contamination="auto").fit(Xs)
-
-    slope, intercept = _trend_slope(daily["date"], daily["revenue"])
-    vol = float(daily["return_rev"].rolling(20).std().dropna().mean() or daily["return_rev"].std())
-
-    model = {
-        "cols": cols,
-        "scaler_mean": scaler.mean_.tolist(),
-        "scaler_scale": scaler.scale_.tolist(),
-        "iso": iso,
-        "trend_slope_ref": slope,
-        "volatility_ref": vol,
-        "ma_windows": [7, 28],
-        "trained_at": datetime.utcnow().isoformat() + "Z"
-    }
-    
-    # Save model to /tmp directory (writable on Render)
     try:
-        joblib.dump(model, MODEL_PATH)
-    except Exception as e:
-        return jsonify({"error": f"Failed to save model: {str(e)}"}), 500
-    
-    return jsonify({
-        "message": "Model trained and saved.", 
-        "model_path": MODEL_PATH, 
-        "meta": {
-            "trend_slope": slope, 
-            "volatility": vol, 
-            "cols": cols
+        d = _prepare_sales(df, cols)
+        daily = _aggregate_daily(d, cols)
+        if len(daily) < 20:
+            return jsonify({"error": "Need at least 20 daily rows after aggregation to train."}), 400
+
+        X = daily[["return_rev"]].to_numpy()
+        scaler = StandardScaler().fit(X)
+        Xs = scaler.transform(X)
+        iso = IsolationForest(random_state=42, contamination="auto").fit(Xs)
+
+        slope, intercept = _trend_slope(daily["date"], daily["revenue"])
+        vol = float(daily["return_rev"].rolling(20).std().dropna().mean() or daily["return_rev"].std())
+
+        meta = {
+            "cols": cols,
+            "trend_slope_ref": slope,
+            "volatility_ref": vol,
+            "ma_windows": [7, 28],
+            "trained_at": datetime.utcnow().isoformat() + "Z"
         }
-    })
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        joblib.dump(iso, MODEL_PATH)
+        joblib.dump(scaler, SCALER_PATH)
+        with open(META_PATH, "w") as fmeta:
+            json.dump(meta, fmeta)
+        return jsonify({"message": "Model trained and saved.", "meta": meta})
+    except Exception as e:
+        logging.error(f"Training error: {e}")
+        return jsonify({"error": f"Training error: {e}"}), 500
+
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    if not os.path.exists(MODEL_PATH):
+    """Analyze sales data using the trained model."""
+    if not (os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH) and os.path.exists(META_PATH)):
         return jsonify({"error": "Model not found — train first."}), 400
-    
     try:
-        model = joblib.load(MODEL_PATH)
+        iso = joblib.load(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        with open(META_PATH) as fmeta:
+            meta = json.load(fmeta)
+        cols = meta["cols"]
+        ma_windows = meta.get("ma_windows", [7, 28])
     except Exception as e:
-        return jsonify({"error": f"Error loading model: {str(e)}"}), 500
-        
-    cols = model["cols"]
-    ma_windows = model.get("ma_windows", [7, 28])
+        logging.error(f"Model load error: {e}")
+        return jsonify({"error": f"Model load error: {e}"}), 500
 
     if 'file' not in request.files:
         return jsonify({"error": "Upload CSV in form field 'file'"}), 400
     f = request.files['file']
+    valid, err = _validate_csv(f)
+    if not valid:
+        return jsonify({"error": err}), 400
     try:
         df = pd.read_csv(f)
     except Exception as e:
+        logging.error(f"CSV parse error: {e}")
         return jsonify({"error": f"CSV parse error: {e}"}), 400
 
     # If user uploads different schema, try inferring again
@@ -246,87 +268,88 @@ def analyze():
         if not cols["date"] or not cols["price"] or not cols["units"]:
             return jsonify({"error": "Could not map date/price/units from CSV."}), 400
 
-    d = _prepare_sales(df, cols)
-    if d.empty:
-        return jsonify({"error": "No valid rows after cleaning."}), 400
+    try:
+        d = _prepare_sales(df, cols)
+        if d.empty:
+            return jsonify({"error": "No valid rows after cleaning."}), 400
 
-    daily = _aggregate_daily(d, cols)
-    if len(daily) < 7:
-        return jsonify({"error": "Need at least 7 daily rows for analysis."}), 400
+        daily = _aggregate_daily(d, cols)
+        if len(daily) < 7:
+            return jsonify({"error": "Need at least 7 daily rows for analysis."}), 400
 
-    # moving averages
-    for w in ma_windows:
-        daily[f"ma_{w}"] = daily["revenue"].rolling(w).mean()
+        # moving averages
+        for w in ma_windows:
+            daily[f"ma_{w}"] = daily["revenue"].rolling(w).mean()
 
-    # anomaly detection
-    scaler_mean = np.array(model["scaler_mean"])
-    scaler_scale = np.array(model["scaler_scale"])
-    X = daily[["return_rev"]].to_numpy()
-    Xs = (X - scaler_mean) / scaler_scale
-    iso = model["iso"]
-    pred = iso.predict(Xs)  # -1 anomaly
-    score = iso.decision_function(Xs)
-    daily["anomaly"] = (pred == -1).astype(int)
-    daily["anom_score"] = score
+        # anomaly detection
+        X = daily[["return_rev"]].to_numpy()
+        Xs = scaler.transform(X)
+        pred = iso.predict(Xs)  # -1 anomaly
+        score = iso.decision_function(Xs)
+        daily["anomaly"] = (pred == -1).astype(int)
+        daily["anom_score"] = score
 
-    # trend/volatility fresh
-    slope, intercept = _trend_slope(daily["date"], daily["revenue"])
-    vol = float(daily["return_rev"].rolling(20).std().dropna().mean() or daily["return_rev"].std())
-    anomaly_rate = float(daily["anomaly"].mean())
-    forecast = _rolling_forecast(daily["date"], daily["revenue"], steps=7)
-    advice = _advisory(slope, vol, anomaly_rate)
+        # trend/volatility fresh
+        slope, intercept = _trend_slope(daily["date"], daily["revenue"])
+        vol = float(daily["return_rev"].rolling(20).std().dropna().mean() or daily["return_rev"].std())
+        anomaly_rate = float(daily["anomaly"].mean())
+        forecast = _rolling_forecast(daily["date"], daily["revenue"], steps=7)
+        advice = _advisory(slope, vol, anomaly_rate)
 
-    # product leaderboard by revenue
-    pid = cols.get("product_id") or cols.get("product_name")
-    top_products = d.groupby(pid)["__revenue__"].sum().sort_values(ascending=False).head(10).reset_index()
-    if cols.get("product_name") and cols["product_name"] in d.columns and pid != cols["product_name"]:
-        name_map = d.dropna(subset=[cols["product_name"]]).drop_duplicates(subset=[pid]).set_index(pid)[cols["product_name"]].to_dict()
-        top_products["product_name"] = top_products[pid].map(name_map)
-    # ensure float
-    top_products["revenue"] = top_products["__revenue__"].astype(float)
-    top_products = top_products.drop(columns=["__revenue__"])
+        # product leaderboard by revenue
+        pid = cols.get("product_id") or cols.get("product_name")
+        top_products = d.groupby(pid)["__revenue__"].sum().sort_values(ascending=False).head(10).reset_index()
+        if cols.get("product_name") and cols["product_name"] in d.columns and pid != cols["product_name"]:
+            name_map = d.dropna(subset=[cols["product_name"]]).drop_duplicates(subset=[pid]).set_index(pid)[cols["product_name"]].to_dict()
+            top_products["product_name"] = top_products[pid].map(name_map)
+        # ensure float
+        top_products["revenue"] = top_products["__revenue__"].astype(float)
+        top_products = top_products.drop(columns=["__revenue__"])
 
-    # rating distribution (if available)
-    rating_hist = None
-    if cols.get("rating") and cols["rating"] in d.columns:
-        valid = d[cols["rating"]].dropna()
-        if not valid.empty:
-            bins = [0,1,2,3,4,5]
-            counts = pd.cut(valid, bins=bins, right=True, include_lowest=True).value_counts().sort_index()
-            rating_hist = {"bins": [f"{bins[i]}-{bins[i+1]}" for i in range(len(bins)-1)], "counts": counts.tolist()}
+        # rating distribution (if available)
+        rating_hist = None
+        if cols.get("rating") and cols["rating"] in d.columns:
+            valid = d[cols["rating"]].dropna()
+            if not valid.empty:
+                bins = [0,1,2,3,4,5]
+                counts = pd.cut(valid, bins=bins, right=True, include_lowest=True).value_counts().sort_index()
+                rating_hist = {"bins": [f"{bins[i]}-{bins[i+1]}" for i in range(len(bins)-1)], "counts": counts.tolist()}
 
-    # chart payloads
-    chart = {
-        "dates": daily["date"].dt.strftime("%Y-%m-%d").tolist(),
-        "revenue": daily["revenue"].astype(float).tolist(),
-        "units": daily["units"].astype(float).tolist(),
-        "moving_averages": {f"ma_{w}": daily[f"ma_{w}"].fillna(None).tolist() for w in ma_windows},
-        "anomalies": daily["anomaly"].astype(int).tolist(),
-        "forecast": forecast
-    }
+        # chart payloads
+        chart = {
+            "dates": daily["date"].dt.strftime("%Y-%m-%d").tolist(),
+            "revenue": daily["revenue"].astype(float).tolist(),
+            "units": daily["units"].astype(float).tolist(),
+            "moving_averages": {f"ma_{w}": daily[f"ma_{w}"].fillna(None).tolist() for w in ma_windows},
+            "anomalies": daily["anomaly"].astype(int).tolist(),
+            "forecast": forecast
+        }
 
-    # trending products (growth last 7 vs prev 7)
-    trending = _trending_products(d, cols)
+        # trending products (growth last 7 vs prev 7)
+        trending = _trending_products(d, cols)
 
-    stats = {
-        "total_revenue": float(d["__revenue__"].sum()),
-        "total_units": float(d[cols["units"]].sum()),
-        "avg_price": float(d[cols["price"]].mean()),
-        "days": int(len(daily)),
-        "volatility": vol,
-        "trend_slope": slope,
-        "anomaly_rate": anomaly_rate
-    }
+        stats = {
+            "total_revenue": float(d["__revenue__"].sum()),
+            "total_units": float(d[cols["units"]].sum()),
+            "avg_price": float(d[cols["price"]].mean()),
+            "days": int(len(daily)),
+            "volatility": vol,
+            "trend_slope": slope,
+            "anomaly_rate": anomaly_rate
+        }
 
-    return jsonify({
-        "columns_used": cols,
-        "basic_stats": stats,
-        "advisory": advice,
-        "chartData": chart,
-        "topProducts": top_products.to_dict(orient="records"),
-        "trendingProducts": trending,
-        "ratingHistogram": rating_hist
-    })
+        return jsonify({
+            "columns_used": cols,
+            "basic_stats": stats,
+            "advisory": advice,
+            "chartData": chart,
+            "topProducts": top_products.to_dict(orient="records"),
+            "trendingProducts": trending,
+            "ratingHistogram": rating_hist
+        })
+    except Exception as e:
+        logging.error(f"Analysis error: {e}")
+        return jsonify({"error": f"Analysis error: {e}"}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
