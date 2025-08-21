@@ -317,12 +317,14 @@ def analyze():
 
         # chart payloads
         import numpy as np
+        def nan_to_none(arr):
+            return [None if pd.isna(x) else x for x in arr]
         chart = {
             "dates": daily["date"].dt.strftime("%Y-%m-%d").tolist(),
             "revenue": daily["revenue"].astype(float).tolist(),
             "units": daily["units"].astype(float).tolist(),
-            # Use np.nan for missing values so JS gets nulls, avoiding pandas fillna(None) bug
-            "moving_averages": {f"ma_{w}": daily[f"ma_{w}"].where(pd.notnull(daily[f"ma_{w}"]), np.nan).tolist() for w in ma_windows},
+            # Convert np.nan to None for valid JSON
+            "moving_averages": {f"ma_{w}": nan_to_none(daily[f"ma_{w}"].tolist()) for w in ma_windows},
             "anomalies": daily["anomaly"].astype(int).tolist(),
             "forecast": forecast
         }
