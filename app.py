@@ -316,11 +316,13 @@ def analyze():
                 rating_hist = {"bins": [f"{bins[i]}-{bins[i+1]}" for i in range(len(bins)-1)], "counts": counts.tolist()}
 
         # chart payloads
+        import numpy as np
         chart = {
             "dates": daily["date"].dt.strftime("%Y-%m-%d").tolist(),
             "revenue": daily["revenue"].astype(float).tolist(),
             "units": daily["units"].astype(float).tolist(),
-            "moving_averages": {f"ma_{w}": daily[f"ma_{w}"].fillna(None).tolist() for w in ma_windows},
+            # Use np.nan for missing values so JS gets nulls, avoiding pandas fillna(None) bug
+            "moving_averages": {f"ma_{w}": daily[f"ma_{w}"].where(pd.notnull(daily[f"ma_{w}"]), np.nan).tolist() for w in ma_windows},
             "anomalies": daily["anomaly"].astype(int).tolist(),
             "forecast": forecast
         }
